@@ -1,0 +1,396 @@
+
+import numpy as np
+import pandas as pd
+import sqlite3
+from pathlib import Path
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_squared_error, r2_score
+
+#Loads the dataset
+data_path = Path("Video_Games_Sales.csv")
+df_raw = pd.read_csv(data_path)
+
+
+#Clean Up Dataset
+df= df_raw.copy()
+#Fill in empty name values with Unknown
+df["Name"] = df["Name"].fillna("Unknown")
+#Check if platform is valid
+allowed_platforms = ['Wii', 'NES', 'GB', 'DS', 'X360', 'PS3', 'PS2', 'SNES', 'GBA', 'PS4', '3DS', 'N64', 'PS', 'XB', 'PC', '2600', 'PSP', 'XOne', 'WiiU', 'GC', 'GEN', 'DC', 'PSV', 'SAT', 'SCD', 'WS', 'NG', 'TG16', '3DO', 'GG', 'PCFX']
+df.loc[~df["Platform"].isin(allowed_platforms), "Platform"] = "Unknown"
+#Replace NA values with median year to model training purposes
+df["Year_of_Release"] = pd.to_numeric(df["Year_of_Release"], errors="coerce")
+df["year_missing"] = df["Year_of_Release"].isna().astype(int)
+year_median = df["Year_of_Release"].median()
+df["Year_of_Release"] = df["Year_of_Release"].fillna(year_median)
+#Fill in Empty ESRB ratings
+df["Rating"] = df["Rating"].fillna("Unknown")
+#Fill in empty Genre values with Unknown
+df["Genre"] = df["Genre"].fillna("Unknown")
+#Fill in empty Publisher values with Unknown
+df["Publisher"] = df["Publisher"].fillna("Unknown")
+#Fill in empty Developer values with Unknown
+df["Developer"] = df["Developer"].fillna("Unknown")
+#Fix missing Critic_Scores with median values so we can train the prediction model
+df["Critic_Score"] = pd.to_numeric(df["Critic_Score"], errors="coerce")
+df["critic_missing"] = df["Critic_Score"].isna().astype(int)
+df["Critic_Score"] = df["Critic_Score"].fillna(df["Critic_Score"].median())
+df["critic_count_missing"] = df["Critic_Count"].isna().astype(int)
+df["Critic_Count"] = df["Critic_Count"].fillna(df["Critic_Count"].median())
+#Fix missing User_Scores with median values so we can train the prediction model
+df["User_Score"] = pd.to_numeric(df["User_Score"], errors="coerce")
+df["user_missing"] = df["User_Score"].isna().astype(int)
+df["User_Score"] = df["User_Score"].fillna(df["User_Score"].median())
+df["user_count_missing"] = df["User_Count"].isna().astype(int)
+df["User_Count"] = df["User_Count"].fillna(df["User_Count"].median())
+#Fill in empty values in all region sales
+for cols in ["NA_Sales", "EU_Sales", "JP_Sales", "Other_Sales", "Global_Sales"]:
+    df[cols] = df[cols].fillna(0)
+
+
+#Connect SQLite to database. 
+db_path = "gamesSQL.db"
+conn = sqlite3.connect(db_path)
+cursor = conn.cursor()
+
+#Creates SQL Tables for Games, Ratings, and Sales
+cursor.execute("DROP TABLE IF EXISTS Ratings")
+cursor.execute("DROP TABLE IF EXISTS Sales")
+cursor.execute("DROP TABLE IF EXISTS Games")
+cursor.execute("DROP TABLE IF EXISTS RawVideoGames")
+
+#Create Games Table
+cursor.execute("""
+CREATE TABLE Games (
+game_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+name TEXT,
+platform TEXT,
+year INT,
+genre TEXT,
+publisher TEXT,
+developer TEXT,
+rating TEXT
+);
+""")
+
+#Create Ratings Table 
+cursor.execute("""
+CREATE TABLE Ratings(
+rating_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+game_ID INT NOT NULL,
+critic_score INT,
+user_score INT,
+critic_count INT,
+user_count INT,
+critic_missing INT,
+user_missing INT,
+critic_count_missing INT,
+user_count_missing INT,
+year_missing INT,
+FOREIGN KEY (game_id) REFERENCES Game(game_id)
+);
+""")
+
+#Create Sales Table
+cursor.execute("""
+CREATE TABLE Sales(
+sales_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+game_ID INT NOT NULL,
+NA_sales REAL DEFAULT 0 CHECK (NA_sales>=0),
+EU_sales REAL DEFAULT 0 CHECK (EU_sales>=0),
+JP_sales REAL DEFAULT 0 CHECK (JP_sales>=0),
+Other_sales REAL DEFAULT 0 CHECK (Other_sales>=0),
+Global_sales REAL CHECK(global_sales >= 0),
+FOREIGN KEY (game_ID) REFERENCES Games(game_ID)
+);
+""")
+
+#Create Raw table to import values into SQL Tables
+cursor.execute("""
+CREATE TABLE RawVideoGames(
+    Name TEXT,
+    Platform TEXT,
+    Year_of_Release INT,
+    Genre TEXT,
+    Publisher TEXT,
+    Developer TEXT,
+    Rating TEXT,
+    NA_Sales REAL,
+    EU_Sales REAL,
+    JP_Sales REAL,
+    Other_Sales REAL,
+    Global_Sales REAL,
+    Critic_Score REAL,
+    Critic_Count INTEGER,
+    User_Score REAL,
+    User_Count INTEGER,
+    critic_missing INTEGER,
+    user_missing INTEGER,
+    critic_count_missing INTEGER,
+    user_count_missing INTEGER,
+    year_missing INTEGER
+);
+""")
+
+#insert dataframe into raw table
+df.to_sql("RawVideoGames",conn, if_exists="append",index=False)
+
+#Insert Distinct Games into Games table
+cursor.execute("""
+INSERT INTO Games (name, platform, year, genre, publisher, developer, rating)
+SELECT DISTINCT
+Name,
+Platform,
+Year_of_Release,
+Genre,
+Publisher,
+Developer,
+Rating
+FROM RawVideoGames
+WHERE Name IS NOT NULL AND Platform IS NOT NULL;
+""")
+
+#Insert Sales into Games
+cursor.execute("""
+INSERT INTO Sales (game_id, na_sales, eu_sales, jp_sales, other_sales, global_sales)
+SELECT
+g.game_id,
+    r.NA_Sales,
+    r.EU_Sales,
+    r.JP_Sales,
+    r.Other_Sales,
+    r.Global_Sales
+FROM RawVideoGames r
+JOIN Games g
+ON r.Name = g.name AND r.Platform = g.platform;
+""")
+
+#Insert Ratings and join onto Game
+cursor.execute("""
+INSERT INTO Ratings(
+game_id,
+critic_score,
+critic_count,
+user_score,
+user_count,
+critic_missing,
+user_missing,
+critic_count_missing,
+user_count_missing,
+year_missing
+)
+SELECT
+g.game_id,
+r.Critic_Score,
+r.Critic_Count,
+r.User_Score,
+r.User_Count,
+r.critic_missing,
+r.user_missing,
+r.critic_count_missing,
+r.user_count_missing,
+r.year_missing
+FROM RawVideoGames r
+JOIN Games g ON r.Name = g.Name AND r.Platform = g.platform;
+""")
+#testing
+
+#load fully joined Dataset
+query = """
+SELECT
+    g.game_id,
+    g.name,
+    g.platform,
+    g.year,
+    g.genre,
+    g.publisher,
+    g.developer,
+    g.rating AS esrb_rating,
+    
+    s.na_sales,
+    s.eu_sales,
+    s.jp_sales,
+    s.other_sales,
+    s.global_sales,
+    
+    r.critic_score,
+    r.critic_count,
+    r.user_score,
+    r.user_count,
+    r.critic_missing,
+    r.user_missing,
+    r.critic_count_missing,
+    r.user_count_missing,
+    r.year_missing
+
+FROM Games g
+JOIN Sales s   ON g.game_id = s.game_id
+JOIN Ratings r ON g.game_id = r.game_id;
+"""
+
+#Training Prediction Model
+
+
+#used to capture the relationshpi between critic and user reception and help predict game sales
+df_model = pd.read_sql_query(query, conn)
+df_model["critic_user_ratio"] = df_model["critic_score"] / (df_model["user_score"] + 1e-6)
+
+#group infrequent developers together with 20 or less games appearing
+def collapse_rare(df, col, min_count=5):
+    counts = df[col].value_counts()
+    rare = counts[counts < min_count].index
+    df[col] = df[col].replace(rare, "Other")
+    return df
+for col in ["publisher", "developer"]:
+    df_model = collapse_rare(df_model, col, min_count=20)
+valid_publishers = set(df_model["publisher"])
+valid_developers = set(df_model["developer"])
+#target will be the feature that we are trying to predict
+#use log sales as without it, the prediction model will be too inaccurate
+df_model["log_global_sales"] = np.log1p(df_model["Global_sales"])
+target = "log_global_sales"
+
+#Features before any reviews
+categorical_pre = ["genre", "platform", "publisher", "developer", "esrb_rating"]
+numerical_pre = ["year", "year_missing"]
+#Features after release with reviews
+categorical_post = ["genre", "platform", "publisher", "developer", "esrb_rating"]
+numerical_post = ["year", "year_missing", "critic_score", "user_score", "critic_count", "user_count", "critic_missing", "user_missing",
+"critic_count_missing", "user_count_missing", "critic_user_ratio"]
+
+#Train/SPlit
+
+#Pre release dataset
+x_pre = df_model[categorical_pre +numerical_pre]
+y = df_model[target]
+x_train_pre, x_test_pre, y_train_pre, y_test_pre = train_test_split(x_pre, y, test_size=0.2, random_state=42)
+
+#Post release dataset
+x_post = df_model[categorical_post+numerical_post]
+x_train_post, x_test_post, y_train_post, y_test_post = train_test_split(x_post, y, test_size=0.2, random_state=42)
+
+#Pre Processor one Hot Encoding
+preprocessor_pre = ColumnTransformer(
+    transformers = [("categorical", OneHotEncoder(handle_unknown="ignore"), categorical_pre), ("numerical", "passthrough", numerical_pre)]
+)
+#Post Processor one Hot Encoding
+processor_post = ColumnTransformer(
+    transformers=[("categorical",OneHotEncoder(handle_unknown="ignore"), categorical_post),  ("numerical", "passthrough", numerical_post)]
+)
+
+#Intialize model pipeline for pre release and post release models
+#using ridge regression instead of linear so we can prevent overfitting and handle multicolinearity. Makes prediction of sales more accurate
+model_prerelease = Pipeline(steps=[("preprocess", preprocessor_pre),("regressor",Ridge(alpha=0.5))])
+model_postrelease = Pipeline(steps=[("preprocess",processor_post),("regressor",Ridge(alpha=0.5))])
+
+#Train the models
+model_prerelease.fit(x_train_pre,y_train_pre)
+model_postrelease.fit(x_train_post,y_train_post)
+
+#Pre release performance
+y_pred_pre = model_prerelease.predict(x_test_pre)
+rmse_pre = np.sqrt(mean_squared_error(y_test_pre, y_pred_pre))
+r2_pre = r2_score(y_test_pre, y_pred_pre)
+
+'''
+print()
+print("PRE-RELEASE MODEL PERFORMANCE")
+print(f"RMSE: {rmse_pre:.4f}")
+print(f"R²:   {r2_pre:.4f}")
+print()
+'''
+
+#Post Release performance
+y_pred_post = model_postrelease.predict(x_test_post)
+rmse_post = np.sqrt(mean_squared_error(y_test_post, y_pred_post))
+r2_post = r2_score(y_test_post, y_pred_post)
+
+'''
+print()
+print("POST-RELEASE MODEL PERFORMANCE")
+print(f"RMSE: {rmse_post:.4f}")
+print(f"R²:   {r2_post:.4f}")
+print()
+'''
+
+#Medians for new-game prediction
+critic_median = df_model["critic_score"].median()
+user_median = df_model["user_score"].median()
+critic_count_median = df_model["critic_count"].median()
+user_count_median = df_model["user_count"].median()
+
+#Fucntion to predict sales for newly released games without pre-release reviews
+def predict_sales_pre_release(genre,platform,publisher, developer, esrb_rating, year):
+    publisher = publisher.strip()
+    developer = developer.strip()
+    genre = genre.strip()
+    platform = platform.strip()
+    esrb_rating = esrb_rating.strip()
+    pub_used = publisher if publisher in valid_publishers else "Other"
+    dev_used = developer if developer in valid_developers else "Other"
+    
+    new_game = pd.DataFrame([{"genre":genre, "platform":platform, "publisher":pub_used, "developer":dev_used, "esrb_rating":esrb_rating, "year":year, "year_missing":0,
+                            }])
+    pred_log = model_prerelease.predict(new_game)[0]
+    return np.expm1(pred_log)
+#Fucntion to predict sales for newly released games
+def predict_sales_post_release(genre, platform, publisher, developer, esrb_rating, year, critic_score=None, user_score=None, critic_count=None, user_count=None):
+    use_critic = critic_score if critic_score is not None else critic_median
+    use_user = user_score if user_score is not None else user_median
+    use_critic_count = critic_count if critic_count is not None else critic_count_median
+    use_user_count = user_count if user_count is not None else user_count_median
+    critic_miss = 0 if critic_score is not None else 1
+    user_miss = 0 if user_score is not None else 1
+    critic_count_miss = 0 if critic_count is not None else 1
+    user_count_miss = 0 if user_count is not None else 1
+    publisher = publisher.strip()
+    developer = developer.strip()
+    genre = genre.strip()
+    platform = platform.strip()
+    esrb_rating = esrb_rating.strip()
+    pub_used = publisher if publisher in valid_publishers else "Other"
+    dev_used = developer if developer in valid_developers else "Other"
+    new_game = pd.DataFrame([{"genre":genre, "platform":platform, "publisher":pub_used, "developer":dev_used, "esrb_rating":esrb_rating, "year":year, "year_missing":0,
+                              "critic_score":use_critic, "user_score":use_user, "critic_count":use_critic_count, "user_count":use_user_count, "critic_missing":critic_miss,
+                              "user_missing":user_miss, "critic_count_missing":critic_count_miss, "user_count_missing":user_count_miss, "critic_user_ratio":use_critic/(use_user+1e-6),
+                             }])
+    pred_log = model_postrelease.predict(new_game)[0]
+    return np.expm1(pred_log)
+    
+#Input game features for sales prediction
+
+#pre release game sales prediction #1
+game_name = "New game #1"
+pre_prediction= predict_sales_pre_release("Action", "PS4","Sony Computer Entertainment","Naughty Dog", "M", 2025)
+print(f"Pre-release sales prediction for {game_name}: {round(pre_prediction,2)} million units")
+
+#post release game sales prediction #1
+post_prediction = predict_sales_post_release("Action", "PS4", "Sony Computer Entertainment", "Naughty Dog", "M", 2025, critic_score=88, user_score=85, critic_count=70, user_count=2000)
+print(f"Post-release sales prediction for {game_name}: {round(post_prediction,2)} million units")
+plt.figure(figsize=(6,4))
+plt.bar(["Pre-release", "Post-release"], [pre_prediction, post_prediction])
+plt.ylabel("Predicted Global Sales (millions)")
+plt.title(f"Sales Prediction Comparison for {game_name}")
+plt.show()
+
+print() 
+
+#pre release game sales prediction #2
+game_name = "New Game #2"
+pre_prediction= predict_sales_pre_release("Racing", "Wii","Nintendo", "Nintendo", "E", 2026)
+print(f"Pre-release sales prediction for {game_name}: {round(pre_prediction,2)} million units")
+
+#post release game sales prediction #2
+post_prediction= predict_sales_post_release("Racing", "Wii","Nintendo", "Nintendo", "E", 2026, critic_score=88, user_score=85, critic_count=70, user_count=2000 )
+print(f"Post-release sales prediction for {game_name}: {round(post_prediction,2)} million units")
+
+plt.figure(figsize=(6,4))
+plt.bar(["Pre-release", "Post-release"], [pre_prediction, post_prediction])
+plt.ylabel("Predicted Global Sales (millions)")
+plt.title(f"Sales Prediction Comparison for {game_name}")
+plt.show()
