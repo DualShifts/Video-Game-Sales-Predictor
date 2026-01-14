@@ -1,0 +1,1 @@
+The purpose of this program is to estimate the potential video game sales before and after its release. It uses data from the top selling games from 1980s-2010s as factors in estimating the potential sales.   
